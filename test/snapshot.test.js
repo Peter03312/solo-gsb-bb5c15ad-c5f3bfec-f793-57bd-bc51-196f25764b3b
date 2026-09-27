@@ -203,7 +203,10 @@ test('startup migrates a v1 database file through v2 to v3 and keeps its row ver
     assert.ok(columns.includes('protocol_version'));
     assert.ok(columns.includes('snapshot_digest'));
     assert.ok(columns.includes('groups'), 'v3 migration adds groups');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.ok(columns.includes('expires_at'), 'v5 migration adds expires_at');
+    assert.ok(columns.includes('expired_at'), 'v5 migration adds expired_at');
+    assert.ok(columns.includes('expired_participants'), 'v5 migration adds expired_participants');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
     assert.ok(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'forfeit_events'").get(),
       'v4 migration adds the forfeit event log'

@@ -6,20 +6,23 @@ const { DatabaseSync } = require('node:sqlite');
 
 const DRAWS_TABLE = `
   CREATE TABLE IF NOT EXISTS draws (
-    id               TEXT PRIMARY KEY,
-    mode             TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
-    status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed')),
-    commitment       TEXT NOT NULL,
-    seed             TEXT NOT NULL,
-    nonce            TEXT,
-    candidates       TEXT NOT NULL,
-    draw_count       INTEGER NOT NULL,
-    result           TEXT,
-    created_at       TEXT NOT NULL,
-    revealed_at      TEXT,
-    protocol_version TEXT,
-    snapshot_digest  TEXT,
-    groups           TEXT
+    id                  TEXT PRIMARY KEY,
+    mode                TEXT NOT NULL DEFAULT 'single' CHECK (mode IN ('single', 'multiparty')),
+    status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'committed', 'revealed', 'expired')),
+    commitment          TEXT NOT NULL,
+    seed                TEXT NOT NULL,
+    nonce               TEXT,
+    candidates          TEXT NOT NULL,
+    draw_count          INTEGER NOT NULL,
+    result              TEXT,
+    created_at          TEXT NOT NULL,
+    revealed_at         TEXT,
+    protocol_version    TEXT,
+    snapshot_digest     TEXT,
+    groups              TEXT,
+    expires_at          TEXT,
+    expired_at          TEXT,
+    expired_participants TEXT
   );
 `;
 
@@ -59,6 +62,9 @@ const FORFEIT_EVENTS_TABLE = `
 // v1 databases predate the 'committed' phase and the participants table.
 // SQLite cannot alter a CHECK constraint in place, so the draws table has to
 // be recreated; existing rows keep their (single-party) semantics.
+// legacy_alter_table keeps the RENAME from rewriting foreign-key references
+// in other tables (none exist at v0 -> v1 today, but the dance matters once
+// participants/forfeit_events exist — see migrateV4ToV5).
 function migrateV0ToV1(db) {
   const ddl = db.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'draws'"
@@ -66,6 +72,7 @@ function migrateV0ToV1(db) {
   if (ddl && ddl.sql.includes("'committed'")) return;
 
   db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec('PRAGMA legacy_alter_table = ON;');
   db.exec('BEGIN;');
   db.exec('ALTER TABLE draws RENAME TO draws_legacy;');
   db.exec(DRAWS_TABLE);
@@ -78,6 +85,7 @@ function migrateV0ToV1(db) {
   `);
   db.exec('DROP TABLE draws_legacy;');
   db.exec('COMMIT;');
+  db.exec('PRAGMA legacy_alter_table = OFF;');
   db.exec('PRAGMA foreign_keys = ON;');
 }
 
@@ -112,6 +120,41 @@ function migrateV3ToV4(db) {
   db.exec(FORFEIT_EVENTS_TABLE);
 }
 
+// v5 adds an optional commitment-phase deadline (expires_at, UTC ISO string)
+// plus terminal expiry bookkeeping (expired_at; expired_participants is the
+// JSON snapshot of participants who had not committed or revealed yet). The
+// status CHECK gains 'expired', which SQLite cannot ALTER in place, so the
+// draws table is rebuilt like the v0 -> v1 migration; every column and row is
+// preserved and all pre-v5 records stay queryable and verifiable.
+// legacy_alter_table is essential here: without it the RENAME rewrites the
+// foreign keys of participants/forfeit_events to point at draws_legacy, and
+// they become dangling once the temp table is dropped.
+function migrateV4ToV5(db) {
+  const ddl = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'draws'"
+  ).get();
+  if (ddl && ddl.sql.includes("'expired'")) return;
+
+  db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec('PRAGMA legacy_alter_table = ON;');
+  db.exec('BEGIN;');
+  db.exec('ALTER TABLE draws RENAME TO draws_legacy;');
+  db.exec(DRAWS_TABLE);
+  db.exec(`
+    INSERT INTO draws (id, mode, status, commitment, seed, nonce, candidates,
+                       draw_count, result, created_at, revealed_at,
+                       protocol_version, snapshot_digest, groups)
+    SELECT id, mode, status, commitment, seed, nonce, candidates,
+           draw_count, result, created_at, revealed_at,
+           protocol_version, snapshot_digest, groups
+      FROM draws_legacy;
+  `);
+  db.exec('DROP TABLE draws_legacy;');
+  db.exec('COMMIT;');
+  db.exec('PRAGMA legacy_alter_table = OFF;');
+  db.exec('PRAGMA foreign_keys = ON;');
+}
+
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
 function openDatabase(dbPath) {
   if (dbPath !== ':memory:') {
@@ -141,6 +184,10 @@ function openDatabase(dbPath) {
   if (version < 4) {
     migrateV3ToV4(db);
     db.exec('PRAGMA user_version = 4;');
+  }
+  if (version < 5) {
+    migrateV4ToV5(db);
+    db.exec('PRAGMA user_version = 5;');
   }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);

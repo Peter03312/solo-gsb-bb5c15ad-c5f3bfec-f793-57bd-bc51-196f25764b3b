@@ -1,6 +1,6 @@
 # verifiable-draw
 
-可验证的公开抽签 API：承诺-揭示（commit-reveal）协议 + 基于 SHA-256 拒绝采样的 Fisher-Yates 洗牌，保证中奖顺序**无偏、可复算、可审计**。当前版本（**v3 协议**）以**有序分组名额**建模：创建抽签时提交 `groups`（每组含唯一 `name`、非空且全局不重复的 `candidates`、不超过本组人数的非负 `quota`，总名额至少 1），承诺把**组名、组顺序、各组归属候选与 quota** 全部绑进快照——任何一项改动都会使校验失败；揭示后每组独立洗牌，返回各组的顺序与中奖者。已揭示的 v3 抽签还支持**放弃与递补**：当前有效中奖者可放弃名额，空出的名额按**原组洗牌顺序**依次递补（候补耗尽则名额空缺），每次放弃都作为带序号的事件追加进日志，随抽签一起查询、一起校验。支持两种熵来源：
+可验证的公开抽签 API：承诺-揭示（commit-reveal）协议 + 基于 SHA-256 拒绝采样的 Fisher-Yates 洗牌，保证中奖顺序**无偏、可复算、可审计**。当前版本（**v3 协议**）以**有序分组名额**建模：创建抽签时提交 `groups`（每组含唯一 `name`、非空且全局不重复的 `candidates`、不超过本组人数的非负 `quota`，总名额至少 1），承诺把**组名、组顺序、各组归属候选与 quota** 全部绑进快照——任何一项改动都会使校验失败；揭示后每组独立洗牌，返回各组的顺序与中奖者。已揭示的 v3 抽签还支持**放弃与递补**：当前有效中奖者可放弃名额，空出的名额按**原组洗牌顺序**依次递补（候补耗尽则名额空缺），每次放弃都作为带序号的事件追加进日志，随抽签一起查询、一起校验。多人承诺抽签还支持**截止时间（expiresAt）**：创建时可传未来的 UTC 时间，到期未揭示即在首个状态变更请求中原子终止，也可调用 `POST /draws/:id/expire` 主动终止；终止是与「最后一位揭示」互斥的终态，已揭示记录不可终止。支持两种熵来源：
 
 - **单 nonce 模式**（兼容旧流程）：调用方揭示一次公共 nonce。
 - **多人承诺模式**：创建抽签时声明参与者名单，每人先提交 `SHA-256(secret)` 承诺、再揭示 secret；全部揭示后，服务端按**固定参与者顺序**拼接各人 secret 的哈希作为 nonce。任一方都无法单独左右结果，整条贡献链可审计。
@@ -15,33 +15,36 @@ v1 / v2 旧记录（扁平 `candidates`/`count`）升级后**继续可查可验*
 docker compose up --build
 ```
 
-服务地址：**http://localhost:3000** （容器映射端口 `3000:3000`；首次启动自动建表，无需手动迁移）。旧版数据库在启动时自动迁移：
+服务地址：**http://localhost:3000** （默认容器映射 `3000:3000`；主机端口可用 `APP_PORT=8080 docker compose up --build` 覆盖，容器内始终监听 3000；首次启动自动建表，无需手动迁移）。旧版数据库在启动时自动迁移：
 
 - v0 → v1：重建 `draws` 表以支持多人承诺阶段；
 - v1 → v2：`draws` 表增加 `protocol_version` / `snapshot_digest` 两列；
 - v2 → v3：`draws` 表增加 `groups` 列（v3 分组定义 JSON），旧行该列为空，仍按其原版本（v1/v2）验证，**可查可验不受影响**；
-- v3 → v4：新增 `forfeit_events` 表（v3 已揭示抽签的放弃/递补事件日志），`draws` 表不变，所有已有记录**可查可验不受影响**。
+- v3 → v4：新增 `forfeit_events` 表（v3 已揭示抽签的放弃/递补事件日志），`draws` 表不变，所有已有记录**可查可验不受影响**；
+- v4 → v5：`draws` 表增加 `expires_at` / `expired_at` / `expired_participants` 三列，并为 `status` 增加 `expired` 终态（SQLite 无法原地改 CHECK，按 v0→v1 的方式重建表，全部行与列原样保留；同时固定 `participants` / `forfeit_events` 的外键指向）。所有已有记录**可查可验不受影响**。
 
 常用命令：
 
 ```bash
-docker compose up --build -d   # 后台运行
-docker compose ps              # 查看状态（含 healthcheck）
-docker compose logs -f app     # 跟踪日志
-docker compose down            # 停止（保留数据卷）
-docker compose down -v         # 停止并删除抽签数据
+docker compose up --build -d          # 后台运行
+APP_PORT=8080 docker compose up --build   # 主机侧改用 8080 端口
+docker compose ps                     # 查看状态（含 healthcheck）
+docker compose logs -f app            # 跟踪日志
+docker compose down                   # 停止（保留数据卷）
+docker compose down -v                # 停止并删除抽签数据
 ```
 
 健康检查：`GET http://localhost:3000/health` → `{"status":"ok"}`。
 
-不使用容器时：`npm ci && npm start`（需 Node.js ≥ 22.13），同样监听 **http://localhost:3000**。
+不使用容器时：`npm ci && npm start`（需 Node.js ≥ 22.13），同样监听 **http://localhost:3000**（可用 `PORT` 环境变量改端口）。
 
 ## 配置（环境变量，均有默认值）
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PORT` | `3000` | 监听端口 |
+| `PORT` | `3000` | 容器/进程内监听端口（compose 内固定为 3000） |
 | `HOST` | `0.0.0.0` | 监听地址 |
+| `APP_PORT` | `3000` | 仅 Docker Compose：映射到主机的 API 端口 |
 | `DATABASE_PATH` | 容器内 `/app/data/draws.db`，本地 `./data/draws.db` | SQLite 文件路径 |
 
 SQLite 数据通过 compose 的命名卷 `draw-data` 持久化。
@@ -79,7 +82,7 @@ SQLite 数据通过 compose 的命名卷 `draw-data` 持久化。
 
 ### 多人承诺模式（熵汇聚）
 
-创建抽签时额外声明 `participants`（2–100 人，名单去重，顺序即后续 nonce 的拼接顺序），随后分两个阶段进行，所有写操作都在 `BEGIN IMMEDIATE` 事务内锁定抽签并**拒绝重复或越序操作**：
+创建抽签时额外声明 `participants`（2–100 人，名单去重，顺序即后续 nonce 的拼接顺序），并可传可选的 `expiresAt`（**未来的 UTC ISO-8601** 时间，形如 `2026-09-27T12:00:00Z`，仅多人模式支持；不传则永不超时，沿用原有流程）。随后分两个阶段进行，所有写操作都在 `BEGIN IMMEDIATE` 事务内锁定抽签并**拒绝重复或越序操作**：
 
 1. **承诺阶段（`pending → committed`）**：每位参与者调用
    `POST /draws/:id/participants/:name/commitment` 提交 `commitment = SHA-256(secret)`（64 位小写 hex）。第一个承诺落地后抽签进入 `committed` 阶段；同一参与者重复承诺返回 `409`；未声明的名字返回 `400`。承诺与揭示均允许乱序到达。
@@ -88,6 +91,15 @@ SQLite 数据通过 compose 的命名卷 `draw-data` 持久化。
    - 参与者调用 `POST /draws/:id/participants/:name/reveal` 提交 secret，服务端校验 `SHA-256(secret)` 与其承诺一致（不一致返回 `409`），重复揭示返回 `409`。
    - **最后一个揭示在同一事务内**：按创建时的固定参与者顺序拼接 `SHA-256(secret_i)` 得到 nonce（每段固定 64 hex，无分隔符、无歧义），对每组复用同一套洗牌算法算出结果并落库、揭示 seed。
 3. **审计**：完成后的响应（及 `GET /draws/:id`）包含 `contributions` 列表——每位参与者的位置、承诺、secret、secret 哈希与两个时间戳。任何人都能用它重新拼出 nonce，再通过 `/verify` 独立复算。
+
+#### 截止时间与终止（expiresAt）
+
+- **创建**：在 `POST /draws` 请求体追加 `"expiresAt": "2026-09-27T12:00:00Z"`（必须严格晚于当前时间、`Z` 结尾的 UTC 时间；过去时间或非 UTC 格式返回 `400`）。创建响应与 `GET /draws/:id` 都会带回 `expiresAt`；未设置时为 `null`。
+- **惰性原子终止**：到期后抽签不会被后台任务改写；**第一个状态变更请求**（提交承诺 / 提交 secret）会在自己的 `BEGIN IMMEDIATE` 事务里把状态原子置为 `expired` 并提交，随后本次迟到的提交以 `409` 拒绝（响应附最终 `draw`）。终止时记录 `expiredAt` 与 `expiredParticipants`——即**尚未提交承诺、或已承诺但未揭示 secret** 的参与者（按固定顺序，含各自 `status: pending|committed` 与已提交的承诺）。
+- **主动终止**：`POST /draws/:id/expire` 可在到期前或到期后立即终止一个未揭示的多人抽签（无 `expiresAt` 的多人抽签也可主动终止）；终止幂等，重复调用返回**同一终态**（相同 `expiredAt` 与 `expiredParticipants`，HTTP 200）。
+- **终态互斥**：「最后一位揭示」与「终止」由带状态条件的 UPDATE 在写锁内互斥执行，只可能产生一个终态：先揭示成功则终止返回 `409`（**已揭示记录不可终止**，响应附最终 `draw`）；先终止成功则最后一个揭示返回 `409`，且不产生任何开奖结果。
+- **截止后冲突**：到期终止后再提交承诺或 secret 一律 `409`（响应附最终 `draw`）；`expired` 抽签同样不能放弃/递补或校验（无结果可验）。
+- `GET /draws/:id` 在终止后展示 `status: "expired"`、`expiresAt`、`expiredAt`、`expiredParticipants`，以及各参与者的最终阶段状态；`expiresAt` 为 `null` 的旧记录/单 nonce 记录响应完全不变。
 
 ## API
 
@@ -104,7 +116,7 @@ curl -X POST http://localhost:3000/draws \
 
 ```json
 { "drawId": "bde4b5b9-…", "mode": "single", "status": "pending", "version": "v3",
-  "commitment": "9a34e8f9…", "snapshotDigest": "3e93e0a1…",
+  "commitment": "9a34e8f9…", "snapshotDigest": "3e93e0a1…", "expiresAt": null,
   "groups": [ { "name": "red", "quota": 2, "candidates": ["alice", "bob", "carol"], "candidateCount": 3 },
               { "name": "blue", "quota": 1, "candidates": ["dave", "erin"], "candidateCount": 2 } ],
   "groupCount": 2, "totalQuota": 3, "candidateCount": 5, "createdAt": "…" }
@@ -143,7 +155,7 @@ curl -X POST http://localhost:3000/draws/<drawId>/reveal \
 curl http://localhost:3000/draws/<drawId>
 ```
 
-v3 响应始终包含 `version: "v3"`、`snapshotDigest` 与有序 `groups`（含 `name`/`quota`/`candidates`/`candidateCount`），以及 `groupCount`/`totalQuota`/`candidateCount`；揭示后额外包含 `seed`、`nonce` 与 `results`（每组 `order`/`winners` 为原始开奖结果，`currentWinners`/`vacancies`/`forfeited` 为重放放弃事件后的当前状态），以及完整放弃/递补事件日志 `forfeits`（每条含 `seq`/`group`/`candidate`/`replacement`/`forfeitedAt`）与 `forfeitCount`。多人抽签还包含 `participants`（每人 `status: pending|committed|revealed`、承诺与时间戳；secret 在整体揭示前不返回）及 `committedCount` / `revealedCount`。
+v3 响应始终包含 `version: "v3"`、`snapshotDigest` 与有序 `groups`（含 `name`/`quota`/`candidates`/`candidateCount`），以及 `groupCount`/`totalQuota`/`candidateCount` 和 `expiresAt`（多人抽签创建时可设置；未设置为 `null`）；揭示后额外包含 `seed`、`nonce` 与 `results`（每组 `order`/`winners` 为原始开奖结果，`currentWinners`/`vacancies`/`forfeited` 为重放放弃事件后的当前状态），以及完整放弃/递补事件日志 `forfeits`（每条含 `seq`/`group`/`candidate`/`replacement`/`forfeitedAt`）与 `forfeitCount`。多人抽签还包含 `participants`（每人 `status: pending|committed|revealed`、承诺与时间戳；secret 在整体揭示前不返回）及 `committedCount` / `revealedCount`。多人抽签被终止后（`status: "expired"`）额外返回 `expiredAt` 与 `expiredParticipants`（尚未承诺或尚未揭示的参与者快照）。
 
 v1/v2 旧记录的响应保持原样：扁平 `candidates` + `count` + `order`/`winners`，`version` 为 `v1` 或 `v2`（v1 的 `snapshotDigest` 为 `null`）。
 
@@ -151,13 +163,15 @@ v1/v2 旧记录的响应保持原样：扁平 `candidates` + `count` + `order`/`
 
 ```bash
 # 1) 创建时声明分组与参与者（参与者顺序固定，即 nonce 拼接顺序）
+#    可选 "expiresAt"：未来的 UTC 时间；到期未揭示将被原子终止
 DRAW=$(curl -s -X POST http://localhost:3000/draws \
   -H 'content-type: application/json' \
   -d '{"groups":[
         {"name":"red","quota":2,"candidates":["alice","bob","carol"]},
         {"name":"blue","quota":1,"candidates":["dave","erin"]}
       ],
-       "participants":["alice","bob","carol"]}')
+       "participants":["alice","bob","carol"],
+       "expiresAt":"2026-09-27T12:00:00Z"}')
 ID=$(echo "$DRAW" | sed -E 's/.*"drawId":"([^"]+)".*/\1/')
 
 # 2) 每人本地生成 secret，只提交其 SHA-256 承诺
@@ -194,13 +208,41 @@ curl -s -X POST http://localhost:3000/draws/$ID/participants/bob/reveal \
 | 场景 | 状态码 |
 |---|---|
 | 缺少 `groups` 或分组约束不合法（组名重复、候选空/重复、quota 超员、总名额 0 等） | `400` |
+| `expiresAt` 不是未来时间、不是 `Z` 结尾的 UTC ISO-8601，或对单人抽签设置截止时间 | `400` |
 | 未声明的参与者名字提交承诺/揭示 | `400` |
 | 承诺不是 64 位小写 hex | `400` |
 | 同一参与者重复承诺 / 重复揭示 | `409` |
 | 尚有参与者未承诺就揭示（附 `waitingFor`） | `409` |
 | secret 与其承诺不一致 | `409` |
 | 开奖后再提交承诺/揭示（附最终 `draw`） | `409` |
+| 到期终止后再提交承诺/揭示（惰性终止，附最终 `draw`） | `409` |
+| 对已揭示抽签调用 `POST /draws/:id/expire`（附最终 `draw`） | `409` |
 | 对多人抽签调 `/reveal`，或对单人抽签调参与者接口 | `409` |
+| 对单人抽签调 `/expire` | `409` |
+
+### 3b. 多人模式：主动终止 / 查询终态
+
+```bash
+# 到期前或到期后均可主动终止；无 expiresAt 的多人抽签同样适用
+curl -X POST http://localhost:3000/draws/$ID/expire
+```
+
+```jsonc
+{ "drawId": "…", "mode": "multiparty", "status": "expired", "version": "v3",
+  "snapshotDigest": "…", "expiresAt": "2026-09-27T12:00:00Z",
+  "expiredAt": "2026-09-27T12:00:04.812Z",
+  "expiredParticipants": [
+    { "name": "bob",   "position": 1, "status": "committed",
+      "commitment": "…", "committedAt": "…" },
+    { "name": "carol", "position": 2, "status": "pending",
+      "commitment": null, "committedAt": null }
+  ],
+  "participants": [ /* 每人的最终阶段状态 */ ] }
+```
+
+- 幂等：重复 `POST /expire` 返回 `200` 与**同一份**终态（`expiredAt` / `expiredParticipants` 不变）。
+- 与最后一位揭示并发时只产生一个终态：揭示先成功则 `/expire` 返回 `409` 且记录保持 `revealed`；终止先成功则迟到的揭示返回 `409`，抽签无 `results` / `nonce`。
+- 抽签不存在返回 `404`；对单 nonce 抽签调用返回 `409`。
 
 ### 4. 独立校验（核心）
 
@@ -338,7 +380,7 @@ curl -X POST http://localhost:3000/draws/<drawId>/forfeits \
 ```bash
 npm ci
 npm start     # http://localhost:3000
-npm test      # node:test 测试套件（含 v3 分组、放弃/递补、多人贡献链、旧版兼容/迁移与无偏性统计检验）
+npm test      # node:test 测试套件（含 v3 分组、放弃/递补、多人贡献链、截止时间/终止、旧版兼容/迁移与无偏性统计检验）
 ```
 
 ## 项目结构
@@ -346,12 +388,13 @@ npm test      # node:test 测试套件（含 v3 分组、放弃/递补、多人�
 ```
 src/lottery.js          v3 分组快照/承诺、各组独立 SHA-256 随机流、拒绝采样、分组 Fisher-Yates；保留 v1/v2 扁平算法与多人 secret 哈希汇聚
 src/forfeit.js          放弃/递补事件日志的确定性重放：当前有效中奖名单、下一位候补、三类篡改检测
-src/db.js               SQLite 连接、自动建表与旧版 schema 迁移（v0 → v1 → v2 → v3 → v4；v3 增加 groups 列，v4 增加 forfeit_events 表）
-src/app.js              Fastify 路由（v3 分组创建 / 单人揭示 / 多人承诺·揭示 / 放弃与递补 / 查询 / 按版本校验 v3·v2·v1）
+src/db.js               SQLite 连接、自动建表与旧版 schema 迁移（v0 → v1 → … → v5；v3 增加 groups 列，v4 增加 forfeit_events 表，v5 重建 draws 表加入 expires_at/expired_at/expired_participants 与 expired 终态）
+src/app.js              Fastify 路由（v3 分组创建 / 单人揭示 / 多人承诺·揭示 / 截止时间惰性终止与 POST /expire / 放弃与递补 / 查询 / 按版本校验 v3·v2·v1）
 src/index.js            入口：配置、启动、优雅退出
 test/api.test.js        v3 单 nonce 端到端、分组输入校验与篡改检测
 test/groups.test.js     v3 快照格式、分组承诺、每组结果、各类篡改检测与 v2→v3 迁移
 test/forfeit.test.js    放弃接口、递补顺序、名额空缺、事件日志重放校验与 v1/v2 兼容
 test/multiparty.test.js v3 多人承诺模式阶段锁定、越序拒绝、贡献链汇聚与分组结果审计
-test/snapshot.test.js   v1/v2 旧记录独立校验、旧库逐级迁移到 v3 后仍可查可验
+test/expiry.test.js     截止时间校验、惰性/主动终止、未提交快照、幂等终态、终态互斥 SQL 守卫与旧记录兼容
+test/snapshot.test.js   v1/v2 旧记录独立校验、旧库逐级迁移到 v3/v5 后仍可查可验
 ```

@@ -435,7 +435,8 @@ test('startup migrates a v2 database file to v3 and keeps v1/v2 rows verifiable'
   try {
     const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
     assert.ok(columns.includes('groups'), 'migration adds groups');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.ok(columns.includes('expires_at'), 'v5 migration adds expires_at');
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5);
     assert.ok(
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'forfeit_events'").get(),
       'v4 migration adds the forfeit event log'

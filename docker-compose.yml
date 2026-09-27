@@ -2,9 +2,13 @@ services:
   app:
     build: .
     ports:
-      - "3000:3000"
+      # Host-side API port (default 3000); override with
+      # APP_PORT=<port> docker compose up --build. The container always
+      # listens on 3000 internally via PORT.
+      - "${APP_PORT:-3000}:3000"
     environment:
       PORT: 3000
+      HOST: 0.0.0.0
       DATABASE_PATH: /app/data/draws.db
     volumes:
       - draw-data:/app/data

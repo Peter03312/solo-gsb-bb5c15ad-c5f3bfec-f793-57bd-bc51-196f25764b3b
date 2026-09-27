@@ -25,6 +25,11 @@ const MAX_PARTICIPANT_NAME_LENGTH = 128;
 const MAX_SECRET_LENGTH = 1024;
 const MAX_GROUPS = 100;
 const MAX_GROUP_NAME_LENGTH = 128;
+const MAX_EXPIRES_AT_LENGTH = 40;
+
+// Canonical UTC ISO-8601 (the 'Z' form), e.g. 2026-09-27T12:00:00Z or with
+// up to nanosecond fractional seconds.
+const UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
 const candidateListSchema = {
   type: 'array',
@@ -133,6 +138,24 @@ function validateGroups(groups) {
   }
   if (totalQuota < 1) {
     return 'total quota must be at least 1: 总名额至少为 1';
+  }
+  return null;
+}
+
+// Validate the optional multiparty commitment deadline. It must be an ISO-8601
+// UTC timestamp ('Z') strictly in the future; null/undefined means no
+// deadline. Returns an error message, or null when valid.
+function validateExpiresAt(value, { now = new Date() } = {}) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !UTC_ISO_RE.test(value)) {
+    return "expiresAt must be a UTC ISO-8601 timestamp like '2026-09-27T12:00:00Z'";
+  }
+  const ts = Date.parse(value);
+  if (Number.isNaN(ts)) {
+    return "expiresAt must be a valid UTC ISO-8601 timestamp like '2026-09-27T12:00:00Z'";
+  }
+  if (ts <= now.getTime()) {
+    return 'expiresAt must be a future UTC timestamp';
   }
   return null;
 }
@@ -246,6 +269,23 @@ function forfeitEventView(row) {
   };
 }
 
+// Deadline/expiry fields shared by all views: `expiresAt` is null for draws
+// created without a deadline; the rest appear once a draw has been terminated
+// (lazily at/after the deadline, or actively via POST /draws/:id/expire).
+function expiryView(row) {
+  return {
+    expiresAt: row.expires_at,
+    ...(row.status === 'expired' ? {
+      expiredAt: row.expired_at,
+      // Snapshot of the participants who still owed a commitment or a secret
+      // at termination time (null for single-nonce draws).
+      expiredParticipants: row.expired_participants === null
+        ? null
+        : JSON.parse(row.expired_participants),
+    } : {}),
+  };
+}
+
 function publicView(row, participantRows, forfeitRows = []) {
   const version = row.protocol_version || PROTOCOL_V1;
 
@@ -269,6 +309,7 @@ function publicView(row, participantRows, forfeitRows = []) {
       totalQuota: groups.reduce((sum, g) => sum + g.quota, 0),
       candidateCount: groups.reduce((sum, g) => sum + g.candidates.length, 0),
       createdAt: row.created_at,
+      ...expiryView(row),
     };
 
     if (row.mode === 'multiparty') {
@@ -296,7 +337,8 @@ function publicView(row, participantRows, forfeitRows = []) {
     return view;
   }
 
-  // v1/v2: flat candidates/count draw (legacy records stay exactly as before).
+  // v1/v2: flat candidates/count draw (legacy records stay exactly as before;
+  // expiry fields only appear for records that actually carry a deadline).
   const view = {
     drawId: row.id,
     mode: row.mode,
@@ -307,6 +349,7 @@ function publicView(row, participantRows, forfeitRows = []) {
     candidates: JSON.parse(row.candidates),
     count: row.draw_count,
     createdAt: row.created_at,
+    ...(row.expires_at !== null || row.status === 'expired' ? expiryView(row) : {}),
   };
 
   if (row.mode === 'multiparty') {
@@ -329,8 +372,8 @@ function buildApp(db, opts = {}) {
 
   const insertDraw = db.prepare(
     `INSERT INTO draws (id, mode, status, commitment, seed, candidates, draw_count, created_at,
-                        protocol_version, snapshot_digest, groups)
-     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`
+                        protocol_version, snapshot_digest, groups, expires_at)
+     VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertParticipant = db.prepare(
     `INSERT INTO participants (draw_id, position, name) VALUES (?, ?, ?)`
@@ -363,6 +406,67 @@ function buildApp(db, opts = {}) {
         SET status = 'revealed', nonce = ?, result = ?, revealed_at = ?
       WHERE id = ? AND mode = 'multiparty' AND status = 'committed'`
   );
+  // Atomic terminal transition: only an unrevealed draw can be expired, so a
+  // concurrent final reveal (pending/committed -> revealed) cannot also win.
+  const expireDraw = db.prepare(
+    `UPDATE draws
+        SET status = 'expired', expired_at = ?, expired_participants = ?
+      WHERE id = ? AND mode = 'multiparty' AND status IN ('pending', 'committed')`
+  );
+  const listOutstandingParticipants = db.prepare(
+    `SELECT * FROM participants WHERE draw_id = ? AND (commitment IS NULL OR secret IS NULL)`
+  );
+
+  // Participants who still owed a commitment or an unrevealed secret at
+  // termination time, in the fixed participant order.
+  function outstandingParticipants(drawId) {
+    return listOutstandingParticipants
+      .all(drawId)
+      .slice()
+      .sort((a, b) => a.position - b.position)
+      .map((p) => ({
+        name: p.name,
+        position: p.position,
+        // 'pending' = no commitment yet; 'committed' = committed but secret
+        // never revealed.
+        status: p.commitment === null ? 'pending' : 'committed',
+        commitment: p.commitment,
+        committedAt: p.committed_at,
+      }));
+  }
+
+  // Terminate an unrevealed multiparty draw. Must run inside the caller's
+  // BEGIN IMMEDIATE transaction. A draw whose deadline has passed is expired
+  // lazily on the first state-changing request; POST /draws/:id/expire uses
+  // force=true to end the draw early as well. Returns the terminal row
+  // (existing or newly produced), or null when the draw cannot be expired —
+  // revealed concurrently, single-nonce, or otherwise not in a pre-reveal
+  // state.
+  function terminateIfDue(row, { now = new Date(), force = false } = {}) {
+    if (row.status === 'expired') return getDraw.get(row.id);
+    const due = force
+      || (row.expires_at !== null && Date.parse(row.expires_at) <= now.getTime());
+    if (!due) return null;
+    if (row.mode !== 'multiparty' || (row.status !== 'pending' && row.status !== 'committed')) {
+      // Revealed concurrently (single draws never have a deadline).
+      return null;
+    }
+    const expiredAt = now.toISOString();
+    const changed = expireDraw.run(
+      expiredAt,
+      JSON.stringify(outstandingParticipants(row.id)),
+      row.id
+    );
+    const fresh = getDraw.get(row.id);
+    return Number(changed.changes) === 1 ? fresh : (fresh.status === 'expired' ? fresh : null);
+  }
+
+  // 409 payload used by every write that races with an expired draw.
+  function expiredConflict(reply, row, participants) {
+    return conflict(reply, 'draw has expired; commitments and secrets are no longer accepted', {
+      draw: publicView(row, participants ?? getParticipants.all(row.id), forfeitRowsFor(row)),
+    });
+  }
   const insertForfeit = db.prepare(
     `INSERT INTO forfeit_events (draw_id, seq, group_name, candidate, replacement, created_at)
      VALUES (?, ?, ?, ?, ?, ?)`
@@ -378,7 +482,7 @@ function buildApp(db, opts = {}) {
 
   app.get('/', async () => ({
     name: 'verifiable-draw',
-    description: 'Commit-reveal public draw: v3 grouped-quota snapshot commitments, SHA-256 rejection-sampling Fisher-Yates per group, sequenced forfeit/replacement log for revealed v3 draws; v1/v2 records remain verifiable',
+    description: 'Commit-reveal public draw: v3 grouped-quota snapshot commitments, SHA-256 rejection-sampling Fisher-Yates per group, sequenced forfeit/replacement log for revealed v3 draws, optional multiparty commitment deadline with atomic lazy/active expiry; v1/v2 records remain verifiable',
     endpoints: {
       create: 'POST /draws',
       reveal: 'POST /draws/:id/reveal',
@@ -388,6 +492,7 @@ function buildApp(db, opts = {}) {
       verifyIndependent: 'POST /verify',
       multipartyCommit: 'POST /draws/:id/participants/:name/commitment',
       multipartyReveal: 'POST /draws/:id/participants/:name/reveal',
+      expire: 'POST /draws/:id/expire',
     },
   }));
 
@@ -407,17 +512,30 @@ function buildApp(db, opts = {}) {
         properties: {
           groups: groupSchema,
           participants: participantListSchema,
+          // Optional commitment-phase deadline (multiparty only): a future
+          // UTC ISO-8601 timestamp. Structural 'string' check is here; the
+          // strict UTC/future rules are validated in the handler.
+          expiresAt: { type: 'string', maxLength: MAX_EXPIRES_AT_LENGTH },
         },
       },
     },
   }, async (request, reply) => {
-    const { groups, participants } = request.body;
+    const { groups, participants, expiresAt } = request.body;
 
     // Cross-field/global validation (unique names, quota within group size,
     // globally unique non-empty candidates, total quota >= 1).
     const groupError = validateGroups(groups);
     if (groupError) {
       return badRequest(reply, groupError);
+    }
+
+    const mode = Array.isArray(participants) ? 'multiparty' : 'single';
+    if (expiresAt !== undefined && mode !== 'multiparty') {
+      return badRequest(reply, 'expiresAt is only supported for multi-party draws (requires participants)');
+    }
+    const expiresAtError = validateExpiresAt(expiresAt);
+    if (expiresAtError) {
+      return badRequest(reply, expiresAtError);
     }
 
     const id = crypto.randomUUID();
@@ -427,7 +545,6 @@ function buildApp(db, opts = {}) {
     const snapshotDigest = snapshotDigestForGroups(groups);
     const commitment = commitmentForVersion(LATEST_PROTOCOL_VERSION, seed, snapshotDigest);
     const createdAt = new Date().toISOString();
-    const mode = Array.isArray(participants) ? 'multiparty' : 'single';
     const totalQuota = groups.reduce((sum, g) => sum + g.quota, 0);
     const totalCandidates = groups.reduce((sum, g) => sum + g.candidates.length, 0);
 
@@ -437,7 +554,8 @@ function buildApp(db, opts = {}) {
     try {
       insertDraw.run(
         id, mode, commitment, seed, JSON.stringify([]), 0, createdAt,
-        LATEST_PROTOCOL_VERSION, snapshotDigest, JSON.stringify(groups)
+        LATEST_PROTOCOL_VERSION, snapshotDigest, JSON.stringify(groups),
+        expiresAt !== undefined ? expiresAt : null
       );
       if (mode === 'multiparty') {
         participants.forEach((name, position) => insertParticipant.run(id, position, name));
@@ -467,6 +585,7 @@ function buildApp(db, opts = {}) {
       totalQuota,
       candidateCount: totalCandidates,
       createdAt,
+      expiresAt: expiresAt !== undefined ? expiresAt : null,
     };
     if (mode === 'multiparty') {
       response.participants = participants.map((name, position) => ({
@@ -509,6 +628,12 @@ function buildApp(db, opts = {}) {
           reply,
           'this is a multi-party draw; use /participants/:name/commitment and /participants/:name/reveal'
         );
+      }
+      // A deadline cannot be set on single-nonce draws, but keep the terminal
+      // guard so an expired row can never be finalized.
+      if (row.status === 'expired') {
+        db.exec('ROLLBACK');
+        return expiredConflict(reply, row, []);
       }
       if (row.status === 'revealed') {
         db.exec('ROLLBACK');
@@ -576,6 +701,15 @@ function buildApp(db, opts = {}) {
       if (row.mode !== 'multiparty') {
         db.exec('ROLLBACK');
         return conflict(reply, 'this is a single-nonce draw; use POST /draws/:id/reveal');
+      }
+      // First state-changing request at/after the deadline terminates the
+      // draw atomically; the late commitment itself is refused with 409. The
+      // expiry is the valid part of this request, so it is committed while
+      // the rejected write is rolled out.
+      const expired = terminateIfDue(row);
+      if (expired) {
+        db.exec('COMMIT');
+        return expiredConflict(reply, expired, getParticipants.all(id));
       }
       if (row.status === 'revealed') {
         db.exec('ROLLBACK');
@@ -646,6 +780,15 @@ function buildApp(db, opts = {}) {
       if (row.mode !== 'multiparty') {
         db.exec('ROLLBACK');
         return conflict(reply, 'this is a single-nonce draw; use POST /draws/:id/reveal');
+      }
+      // First state-changing request at/after the deadline terminates the
+      // draw atomically; the late secret is refused with 409. The expiry is
+      // the valid part of this request, so it is committed while the rejected
+      // secret write is rolled out.
+      const expired = terminateIfDue(row);
+      if (expired) {
+        db.exec('COMMIT');
+        return expiredConflict(reply, expired, getParticipants.all(id));
       }
       if (row.status === 'revealed') {
         db.exec('ROLLBACK');
@@ -735,6 +878,58 @@ function buildApp(db, opts = {}) {
 
       const finalRow = getDraw.get(id);
       return reply.send(publicView(finalRow, getParticipants.all(id)));
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* no active transaction */ }
+      throw err;
+    }
+  });
+
+  // ---- Multi-party draw: active termination (idempotent) -----------------
+  // POST /draws/:id/expire ends an unrevealed multi-party draw immediately
+  // (before or after the deadline) inside BEGIN IMMEDIATE: it records the
+  // termination time and the participants who still owed a commitment or a
+  // secret. A draw that passed its expiresAt but was never touched is expired
+  // here as well. The transition is guarded in SQL, so a concurrent last
+  // reveal can only leave one terminal state; revealed draws cannot be
+  // expired. Repeated calls return the same terminal state (200).
+  app.post('/draws/:id/expire', async (request, reply) => {
+    const { id } = request.params;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = getDraw.get(id);
+      if (!row) {
+        db.exec('ROLLBACK');
+        return notFound(reply, id);
+      }
+      if (row.mode !== 'multiparty') {
+        db.exec('ROLLBACK');
+        return conflict(reply, 'this is a single-nonce draw; expiry is only supported for multi-party draws');
+      }
+      if (row.status === 'revealed') {
+        db.exec('ROLLBACK');
+        return conflict(reply, 'draw already revealed; revealed draws cannot be expired', {
+          draw: publicView(row, getParticipants.all(id), forfeitRowsFor(row)),
+        });
+      }
+      // Already expired (lazily or by an earlier POST): same terminal state.
+      if (row.status === 'expired') {
+        db.exec('ROLLBACK');
+        return reply.send(publicView(row, getParticipants.all(id), forfeitRowsFor(row)));
+      }
+
+      const expired = terminateIfDue(row, { force: true });
+      if (!expired) {
+        // Lost the race against the final reveal: its revealed terminal state
+        // wins; a revealed record cannot be expired.
+        db.exec('ROLLBACK');
+        const winner = getDraw.get(id);
+        return conflict(reply, 'draw already revealed; revealed draws cannot be expired', {
+          draw: publicView(winner, getParticipants.all(id), forfeitRowsFor(winner)),
+        });
+      }
+      db.exec('COMMIT');
+      return reply.send(publicView(getDraw.get(id), getParticipants.all(id)));
     } catch (err) {
       try { db.exec('ROLLBACK'); } catch { /* no active transaction */ }
       throw err;
@@ -842,7 +1037,9 @@ function buildApp(db, opts = {}) {
       return notFound(reply, request.params.id);
     }
     if (row.status !== 'revealed') {
-      return conflict(reply, `draw is ${row.status}; nothing to verify yet`);
+      return conflict(reply, row.status === 'expired'
+        ? 'draw expired without a reveal; there is no outcome to verify'
+        : `draw is ${row.status}; nothing to verify yet`);
     }
     const stored = JSON.parse(row.result);
     const participantRows = row.mode === 'multiparty' ? getParticipants.all(row.id) : [];
@@ -1306,4 +1503,4 @@ function verifyRecord(input) {
   return verifyRecordLegacy(input);
 }
 
-module.exports = { buildApp, validateGroups };
+module.exports = { buildApp, validateGroups, validateExpiresAt };
